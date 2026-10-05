@@ -1,0 +1,1316 @@
+diff --git a/src-tauri/src/cmd/proxy.rs b/src-tauri/src/cmd/proxy.rs
+index 66e027c..daa6521 100644
+--- a/src-tauri/src/cmd/proxy.rs
++++ b/src-tauri/src/cmd/proxy.rs
+@@ -1,8 +1,9 @@
+ use super::CmdResult;
+ use crate::{
+     cmd::StringifyErr as _,
+-    config::Config,
++    config::{Config, PrfOption, profiles::PROFILE_WRITE_LOCK},
+     core::{
++        CoreManager,
+         handle::Handle,
+         proxy_view::{ProxyViewBuilder, ProxyViewInput, ProxyViewV1},
+         tray::Tray,
+@@ -15,6 +16,7 @@ use std::{
+     collections::HashSet,
+     sync::atomic::{AtomicBool, Ordering},
+ };
++use tauri_plugin_mihomo::models::ProxyType;
+ 
+ /// Merges one selection pair into fresh backend state to avoid stale-list overwrites.
+ #[tauri::command]
+@@ -34,6 +36,116 @@ pub async fn forget_selected_node(group_name: String) -> CmdResult<()> {
+ static TRAY_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
+ static TRAY_SYNC_PENDING: AtomicBool = AtomicBool::new(false);
+ 
++#[tauri::command]
++pub async fn change_deleted_nodes(
++    index: String,
++    names: Vec<String>,
++    restore: bool,
++) -> CmdResult<crate::core::validate::ValidationOutcome> {
++    let profile_write_guard = PROFILE_WRITE_LOCK.lock().await;
++    let view = if restore { None } else { Some(get_proxy_view().await?) };
++    let requested: HashSet<String> = names.iter().cloned().collect();
++    if let Some(view) = &view {
++        let available: HashSet<&str> = view
++            .records
++            .values()
++            .filter(|node| {
++                !matches!(
++                    node.proxy_type,
++                    ProxyType::Direct
++                        | ProxyType::Reject
++                        | ProxyType::RejectDrop
++                        | ProxyType::Compatible
++                        | ProxyType::Pass
++                        | ProxyType::PassRule
++                        | ProxyType::Dns
++                )
++            })
++            .map(|node| node.name.as_str())
++            .collect();
++        if !requested.iter().all(|name| available.contains(name.as_str())) {
++            return Err("The node list changed. Refresh and select the nodes again.".into());
++        }
++    }
++    let profiles = Config::profiles().await;
++    let profile_uid = index.clone();
++    let result = profiles
++        .with_data_modify(|mut candidate| async move {
++            if candidate.current.as_deref() != Some(profile_uid.as_str()) {
++                anyhow::bail!("The active profile changed. Select the nodes again.");
++            }
++            let original = candidate.clone();
++            let item = candidate
++                .items
++                .as_mut()
++                .and_then(|items| {
++                    items
++                        .iter_mut()
++                        .find(|item| item.uid.as_deref() == Some(profile_uid.as_str()))
++                })
++                .ok_or_else(|| anyhow::anyhow!("Active profile not found"))?;
++            let option = item.option.get_or_insert_with(PrfOption::default);
++            let deleted = option.deleted_nodes.get_or_insert_with(Vec::new);
++            if restore {
++                deleted.retain(|name| !requested.contains(name.as_str()));
++                option.deleted_providers = Some(vec![]);
++            } else {
++                deleted.extend(names.iter().cloned().map(Into::into));
++                deleted.sort();
++                deleted.dedup();
++                let emptied = option.deleted_providers.get_or_insert_with(Vec::new);
++                if let Some(view) = &view {
++                    for provider in &view.providers {
++                        let members: Vec<_> = provider
++                            .proxy_record_ids
++                            .iter()
++                            .filter_map(|id| view.records.get(id))
++                            .filter(|node| {
++                                !matches!(
++                                    node.proxy_type,
++                                    ProxyType::Direct
++                                        | ProxyType::Reject
++                                        | ProxyType::RejectDrop
++                                        | ProxyType::Compatible
++                                        | ProxyType::Pass
++                                        | ProxyType::PassRule
++                                        | ProxyType::Dns
++                                )
++                            })
++                            .collect();
++                        if !members.is_empty() && members.iter().all(|node| requested.contains(&node.name)) {
++                            emptied.push(provider.name.clone().into());
++                        }
++                    }
++                }
++                emptied.sort();
++                emptied.dedup();
++                if let Some(selected) = &mut item.selected {
++                    selected.retain(|entry| !entry.now.as_deref().is_some_and(|name| requested.contains(name)));
++                }
++            }
++            match CoreManager::global()
++                .update_config_forced_with_profiles(&candidate, &original)
++                .await?
++            {
++                Ok(guard) => Ok((candidate, Ok(guard))),
++                Err(outcome) => Ok((original, Err(outcome))),
++            }
++        })
++        .await
++        .stringify_err()?;
++    let config_update_guard = match result {
++        Ok(guard) => guard,
++        Err(outcome) => return Ok(outcome),
++    };
++    crate::config::profiles::activate_selected_nodes();
++    drop(config_update_guard);
++    drop(profile_write_guard);
++    Handle::refresh_clash();
++    Handle::notify_profile_changed(&index.into());
++    Ok(crate::core::validate::ValidationOutcome::Valid)
++}
++
+ fn runtime_group_order(config: Option<&Mapping>) -> Vec<String> {
+     let mut seen = HashSet::new();
+ 
+diff --git a/src-tauri/src/config/prfitem.rs b/src-tauri/src/config/prfitem.rs
+index f7c84de..3e0ef41 100644
+--- a/src-tauri/src/config/prfitem.rs
++++ b/src-tauri/src/config/prfitem.rs
+@@ -103,6 +103,12 @@ pub struct PrfOption {
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub allow_auto_update: Option<bool>,
+ 
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub deleted_nodes: Option<Vec<String>>,
++
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub deleted_providers: Option<Vec<String>>,
++
+     pub merge: Option<String>,
+ 
+     pub script: Option<String>,
+@@ -125,6 +131,8 @@ impl PrfOption {
+                 result.danger_accept_invalid_certs =
+                     b_ref.danger_accept_invalid_certs.or(result.danger_accept_invalid_certs);
+                 result.allow_auto_update = b_ref.allow_auto_update.or(result.allow_auto_update);
++                result.deleted_nodes = b_ref.deleted_nodes.clone().or(result.deleted_nodes);
++                result.deleted_providers = b_ref.deleted_providers.clone().or(result.deleted_providers);
+                 result.update_interval = b_ref.update_interval.or(result.update_interval);
+                 result.merge = b_ref.merge.clone().or(result.merge);
+                 result.script = b_ref.script.clone().or(result.script);
+@@ -406,6 +414,8 @@ impl PrfItem {
+                 proxies,
+                 groups,
+                 allow_auto_update,
++                deleted_nodes: option.and_then(|o| o.deleted_nodes.clone()),
++                deleted_providers: option.and_then(|o| o.deleted_providers.clone()),
+                 ..PrfOption::default()
+             }),
+             home,
+diff --git a/src-tauri/src/enhance/mod.rs b/src-tauri/src/enhance/mod.rs
+index 02cc573..b8e87da 100644
+--- a/src-tauri/src/enhance/mod.rs
++++ b/src-tauri/src/enhance/mod.rs
+@@ -1,6 +1,7 @@
+ mod chain;
+ pub mod field;
+ mod merge;
++mod node_delete;
+ mod script;
+ pub mod seq;
+ mod tun;
+@@ -963,6 +964,17 @@ pub async fn enhance(
+     let config = authoritative.enforce(config);
+     let config = ensure_lan_bind_address(config);
+ 
++    let deletion_options = profiles
++        .get_item(profile_uid)
++        .ok()
++        .and_then(|item| item.option.as_ref());
++    let deleted_nodes = deletion_options
++        .and_then(|option| option.deleted_nodes.as_deref())
++        .unwrap_or_default();
++    let deleted_providers = deletion_options
++        .and_then(|option| option.deleted_providers.as_deref())
++        .unwrap_or_default();
++    let config = node_delete::apply_deleted_nodes(config, deleted_nodes, deleted_providers);
+     let config = cleanup_proxy_groups(config);
+     let config = use_sort(config);
+ 
+diff --git a/src-tauri/src/enhance/node_delete.rs b/src-tauri/src/enhance/node_delete.rs
+new file mode 100644
+index 0000000..85378c1
+--- /dev/null
++++ b/src-tauri/src/enhance/node_delete.rs
+@@ -0,0 +1,225 @@
++use serde_yaml_ng::{Mapping, Value};
++use smartstring::alias::String;
++use std::collections::HashSet;
++
++pub(super) fn apply_deleted_nodes(mut config: Mapping, names: &[String], providers_deleted: &[String]) -> Mapping {
++    if names.is_empty() && providers_deleted.is_empty() {
++        return config;
++    }
++    let deleted: HashSet<&str> = names.iter().map(String::as_str).collect();
++    if let Some(Value::Sequence(proxies)) = config.get_mut("proxies") {
++        proxies.retain(|proxy| {
++            !proxy
++                .get("name")
++                .and_then(Value::as_str)
++                .is_some_and(|name| deleted.contains(name))
++        });
++    }
++
++    let exact_names = names
++        .iter()
++        .map(|name| regex::escape(name).replace('`', "\\x{60}"))
++        .collect::<Vec<_>>()
++        .join("|");
++    let pattern = format!("^({exact_names})$");
++    if let Some(Value::Mapping(providers)) = config.get_mut("proxy-providers") {
++        for (name, provider) in providers.iter_mut() {
++            let Some(provider) = provider.as_mapping_mut() else {
++                continue;
++            };
++            if name
++                .as_str()
++                .is_some_and(|name| providers_deleted.iter().any(|deleted| deleted.as_str() == name))
++            {
++                *provider = Mapping::new();
++                provider.insert(Value::from("type"), Value::from("inline"));
++                let mut direct = Mapping::new();
++                direct.insert(Value::from("name"), Value::from("DIRECT"));
++                direct.insert(Value::from("type"), Value::from("direct"));
++                provider.insert(Value::from("payload"), Value::Sequence(vec![Value::Mapping(direct)]));
++                continue;
++            }
++            let prefix = provider
++                .get("override")
++                .and_then(|value| value.get("additional-prefix"))
++                .and_then(Value::as_str)
++                .unwrap_or_default();
++            let suffix = provider
++                .get("override")
++                .and_then(|value| value.get("additional-suffix"))
++                .and_then(Value::as_str)
++                .unwrap_or_default();
++            // Provider filters run before name overrides; groups see the final names.
++            let raw_names = names
++                .iter()
++                .filter_map(|name| {
++                    let name = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
++                    Some(regex::escape(name).replace('`', "\\x{60}"))
++                })
++                .collect::<Vec<_>>()
++                .join("|");
++            if !raw_names.is_empty() {
++                add_exclusion(provider, &format!("^({raw_names})$"));
++            }
++        }
++    }
++
++    if let Some(Value::Sequence(groups)) = config.get_mut("proxy-groups") {
++        for group in groups.iter_mut().filter_map(Value::as_mapping_mut) {
++            add_exclusion(group, &pattern);
++            group
++                .entry(Value::from("empty-fallback"))
++                .or_insert_with(|| Value::from("DIRECT"));
++            if let Some(Value::Sequence(proxies)) = group.get_mut("proxies") {
++                proxies.retain(|proxy| !proxy.as_str().is_some_and(|name| deleted.contains(name)));
++            }
++            let has_proxies = group
++                .get("proxies")
++                .and_then(Value::as_sequence)
++                .is_some_and(|items| !items.is_empty());
++            let has_providers = group
++                .get("use")
++                .and_then(Value::as_sequence)
++                .is_some_and(|items| !items.is_empty());
++            let includes_all = ["include-all", "include-all-proxies", "include-all-providers"]
++                .iter()
++                .any(|key| group.get(*key).and_then(Value::as_bool).unwrap_or(false));
++            if !has_proxies && !has_providers && !includes_all {
++                group.insert(Value::from("proxies"), Value::Sequence(vec![Value::from("DIRECT")]));
++            }
++        }
++    }
++    let mut value = Value::Mapping(config);
++    repair_references(&mut value, &deleted);
++    match value {
++        Value::Mapping(config) => config,
++        _ => unreachable!(),
++    }
++}
++
++fn add_exclusion(mapping: &mut Mapping, pattern: &str) {
++    let filter = match mapping.get("exclude-filter").and_then(Value::as_str) {
++        Some(existing) if !existing.is_empty() => existing
++            .split("```")
++            .map(|part| format!("({part})|{pattern}"))
++            .collect::<Vec<_>>()
++            .join("```"),
++        _ => pattern.to_owned(),
++    };
++    mapping.insert(Value::from("exclude-filter"), Value::from(filter));
++}
++
++fn repair_references(value: &mut Value, deleted: &HashSet<&str>) {
++    match value {
++        Value::Mapping(map) => {
++            for (key, value) in map.iter_mut() {
++                if matches!(key.as_str(), Some("dialer-proxy" | "proxy" | "empty-fallback"))
++                    && value.as_str().is_some_and(|name| deleted.contains(name))
++                {
++                    *value = Value::from("DIRECT");
++                } else if key.as_str() == Some("rules") {
++                    repair_rules(value, deleted);
++                } else if key.as_str() == Some("sub-rules") {
++                    if let Some(sub_rules) = value.as_mapping_mut() {
++                        for rules in sub_rules.values_mut() {
++                            repair_rules(rules, deleted);
++                        }
++                    }
++                } else {
++                    repair_references(value, deleted);
++                }
++            }
++        }
++        Value::Sequence(items) => {
++            for item in items {
++                repair_references(item, deleted);
++            }
++        }
++        _ => {}
++    }
++}
++
++fn repair_rules(value: &mut Value, deleted: &HashSet<&str>) {
++    let Some(rules) = value.as_sequence_mut() else {
++        return;
++    };
++    for rule in rules {
++        let Some(text) = rule.as_str() else {
++            continue;
++        };
++        let mut fields: Vec<&str> = text.split(',').collect();
++        let target = if fields.last().is_some_and(|field| field.trim() == "no-resolve") {
++            fields.len().checked_sub(2)
++        } else {
++            fields.len().checked_sub(1)
++        };
++        if let Some(target) = target
++            && deleted.contains(fields[target].trim())
++        {
++            fields[target] = "DIRECT";
++            *rule = Value::from(fields.join(","));
++        }
++    }
++}
++
++#[cfg(test)]
++#[allow(clippy::expect_used)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn deletion_repairs_groups_rules_and_dialers_without_changing_source() {
++        let source: Mapping = serde_yaml_ng::from_str(
++            "proxies:\n  - {name: A, type: ss}\n  - {name: B, type: ss, dialer-proxy: A}\nproxy-groups:\n  - {name: Select, type: select, proxies: [A]}\nrules: [DOMAIN, 'IP-CIDR,1.0.0.0/8,A,no-resolve', 'MATCH,A']",
++        ).expect("parse source");
++        let result = apply_deleted_nodes(source.clone(), &["A".into()], &[]);
++        assert_eq!(source["proxies"].as_sequence().expect("source proxies").len(), 2);
++        assert_eq!(result["proxies"].as_sequence().expect("proxies").len(), 1);
++        assert_eq!(result["proxies"][0]["dialer-proxy"], "DIRECT");
++        assert_eq!(result["proxy-groups"][0]["proxies"][0], "DIRECT");
++        assert_eq!(result["proxy-groups"][0]["empty-fallback"], "DIRECT");
++        assert_eq!(result["rules"][1], "IP-CIDR,1.0.0.0/8,DIRECT,no-resolve");
++        assert_eq!(result["rules"][2], "MATCH,DIRECT");
++        assert_eq!(apply_deleted_nodes(source.clone(), &[], &[]), source);
++    }
++
++    #[test]
++    fn provider_filter_preserves_existing_filter_and_matches_exact_names() {
++        let source: Mapping = serde_yaml_ng::from_str(
++            "proxy-providers:\n  P: {type: inline, exclude-filter: old, payload: []}\nproxy-groups:\n  - {name: Select, type: select, use: [P]}",
++        ).expect("parse provider");
++        let result = apply_deleted_nodes(source, &["A.+[1]".into(), "```".into()], &[]);
++        let filter = result["proxy-providers"]["P"]["exclude-filter"]
++            .as_str()
++            .expect("filter");
++        let patterns: Vec<_> = filter.split("```").collect();
++        assert_eq!(patterns.len(), 1);
++        let exact = regex::Regex::new(patterns[0]).expect("exact regex");
++        assert!(exact.is_match("old"));
++        assert!(exact.is_match("A.+[1]"));
++        assert!(exact.is_match("```"));
++        assert!(!exact.is_match("A.+[1] backup"));
++        assert_eq!(result["proxy-groups"][0]["use"][0], "P");
++    }
++
++    #[test]
++    fn an_emptied_provider_remains_valid_with_a_direct_fallback() {
++        let source: Mapping = serde_yaml_ng::from_str(
++            "proxy-providers:\n  P: {type: http, url: 'https://example.test/nodes', path: './nodes.yaml'}\nproxy-groups:\n  - {name: Select, type: select, use: [P]}",
++        ).expect("parse provider");
++        let result = apply_deleted_nodes(source, &["A".into()], &["P".into()]);
++        assert_eq!(result["proxy-providers"]["P"]["type"], "inline");
++        assert_eq!(result["proxy-providers"]["P"]["payload"][0]["type"], "direct");
++        assert_eq!(result["proxy-groups"][0]["use"][0], "P");
++    }
++
++    #[test]
++    fn displayed_names_do_not_delete_other_prefixed_provider_nodes() {
++        let source: Mapping = serde_yaml_ng::from_str(
++            "proxy-providers:\n  P: {type: inline, override: {additional-prefix: 'P '}, payload: []}\n  Q: {type: inline, override: {additional-prefix: 'Q '}, payload: []}",
++        ).expect("parse providers");
++        let result = apply_deleted_nodes(source, &["P A".into()], &[]);
++        assert_eq!(result["proxy-providers"]["P"]["exclude-filter"], "^(A)$");
++        assert!(result["proxy-providers"]["Q"].get("exclude-filter").is_none());
++    }
++}
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index c186457..b39ff40 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -192,6 +192,7 @@ mod app_init {
+             cmd::patch_profiles_config,
+             cmd::view_profile,
+             cmd::patch_profile,
++            cmd::change_deleted_nodes,
+             cmd::create_profile,
+             cmd::import_profile,
+             cmd::reorder_profile,
+diff --git a/src/components/proxy/node-deletion-context.tsx b/src/components/proxy/node-deletion-context.tsx
+new file mode 100644
+index 0000000..2b7dbf6
+--- /dev/null
++++ b/src/components/proxy/node-deletion-context.tsx
+@@ -0,0 +1,309 @@
++import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
++import { Alert, Box, Button, Typography } from '@mui/material'
++import {
++  useCallback,
++  useMemo,
++  useRef,
++  useState,
++  type MouseEvent,
++  type ReactNode,
++} from 'react'
++import { useTranslation } from 'react-i18next'
++
++import { BaseDialog } from '@/components/base'
++import { useProfiles } from '@/hooks/use-profiles'
++import { useAppRefreshers, useProxiesData } from '@/providers/app-data-context'
++import { changeDeletedNodes } from '@/services/cmds'
++import { showNotice } from '@/services/notice-service'
++
++import { isDeletableNode, selectNodeNames } from './node-selection-model'
++import {
++  NodeDeletionContext,
++  type NodeDeletionState,
++} from './use-node-deletion'
++
++export function NodeDeletionProvider({
++  children,
++  enabled,
++}: {
++  children: ReactNode
++  enabled: boolean
++}) {
++  const { t } = useTranslation()
++  const { profiles, current, mutateProfiles } = useProfiles()
++  const { proxyView } = useProxiesData()
++  const { refreshProxy } = useAppRefreshers()
++  const [active, setActive] = useState(false)
++  const [groupName, setGroupName] = useState<string>()
++  const [selected, setSelected] = useState<Set<string>>(() => new Set())
++  const [busy, setBusy] = useState(false)
++  const [confirmAll, setConfirmAll] = useState<string[] | null>(null)
++  const [error, setError] = useState<string>()
++  const ordersRef = useRef(new Map<string, string[]>())
++  const anchorRef = useRef<{ name: string; group: string } | undefined>(
++    undefined,
++  )
++  const busyRef = useRef(false)
++  const rootRef = useRef<HTMLDivElement>(null)
++
++  const candidates = useMemo(() => {
++    if (!proxyView) return []
++    const group =
++      proxyView.global?.name === groupName
++        ? proxyView.global
++        : proxyView.groups.find((item) => item.name === groupName)
++    const nodes = groupName
++      ? (group?.members ?? []).flatMap((member) =>
++          member.kind === 'node' && proxyView.records[member.recordId]
++            ? [proxyView.records[member.recordId]]
++            : [],
++        )
++      : Object.values(proxyView.records)
++    return Array.from(
++      new Set(nodes.filter(isDeletableNode).map((node) => node.name)),
++    )
++  }, [proxyView, groupName])
++  const eligible = useMemo(() => new Set(candidates), [candidates])
++  const selectedNames = useMemo(
++    () => Array.from(selected).filter((name) => eligible.has(name)),
++    [selected, eligible],
++  )
++  const deletedNames = current?.option?.deleted_nodes ?? []
++
++  const registerOrder = useCallback((next: Map<string, string[]>) => {
++    ordersRef.current = next
++  }, [])
++  const start = useCallback(
++    (group?: string) => {
++      if (!enabled || busyRef.current) return
++      setGroupName(group)
++      setSelected(new Set())
++      setActive(true)
++      anchorRef.current = undefined
++      rootRef.current?.focus()
++    },
++    [enabled],
++  )
++  const select = useCallback(
++    (name: string, group: string, event: MouseEvent, checkbox = false) => {
++      if (busyRef.current) return
++      const order = ordersRef.current.get(group) ?? []
++      const sameGroup = anchorRef.current?.group === group
++      setSelected((previous) =>
++        selectNodeNames(
++          previous,
++          name,
++          order,
++          sameGroup ? anchorRef.current?.name : undefined,
++          checkbox || event.ctrlKey || event.metaKey,
++          !checkbox && event.shiftKey,
++        ),
++      )
++      if (!event.shiftKey || !sameGroup) anchorRef.current = { name, group }
++    },
++    [],
++  )
++
++  const stop = () => {
++    if (busyRef.current) return
++    setActive(false)
++    setSelected(new Set())
++    anchorRef.current = undefined
++  }
++  const apply = async (names: string[], restore = false) => {
++    if (busyRef.current || !profiles?.current || names.length === 0) return
++    busyRef.current = true
++    setBusy(true)
++    setError(undefined)
++    try {
++      const outcome = await changeDeletedNodes(profiles.current, names, restore)
++      if (outcome.status !== 'valid') {
++        setError(t('proxies.page.nodeDeletion.failed'))
++        return
++      }
++      setSelected(new Set())
++      setConfirmAll(null)
++      await Promise.all([mutateProfiles(), refreshProxy()])
++      showNotice.success(
++        t(
++          restore
++            ? 'proxies.page.nodeDeletion.restored'
++            : 'proxies.page.nodeDeletion.deleted',
++          { count: names.length },
++        ),
++      )
++    } catch (cause) {
++      setError(String(cause))
++    } finally {
++      busyRef.current = false
++      setBusy(false)
++    }
++  }
++  const value = useMemo<NodeDeletionState>(
++    () => ({
++      active: active && enabled,
++      busy,
++      groupName,
++      selected,
++      start,
++      registerOrder,
++      select,
++    }),
++    [active, enabled, busy, groupName, selected, start, registerOrder, select],
++  )
++
++  return (
++    <NodeDeletionContext value={enabled ? value : null}>
++      <Box
++        ref={rootRef}
++        tabIndex={-1}
++        sx={{
++          height: '100%',
++          display: 'flex',
++          flexDirection: 'column',
++          outline: 'none',
++        }}
++        onKeyDown={(event) => {
++          if (!active || busyRef.current || confirmAll) return
++          if (
++            event.target instanceof Element &&
++            event.target.closest(
++              'input:not([type="checkbox"]), textarea, [contenteditable="true"]',
++            )
++          )
++            return
++          if (event.key === 'Delete') {
++            event.preventDefault()
++            void apply(selectedNames)
++          } else if (
++            (event.ctrlKey || event.metaKey) &&
++            event.key.toLowerCase() === 'a'
++          ) {
++            event.preventDefault()
++            setSelected(new Set(candidates))
++          } else if (event.key === 'Escape') {
++            event.preventDefault()
++            stop()
++          }
++        }}
++      >
++        {enabled && (
++          <Box
++            sx={{
++              display: 'flex',
++              flexWrap: 'wrap',
++              alignItems: 'center',
++              gap: 1,
++              px: 1.5,
++              py: 1,
++            }}
++          >
++            {active ? (
++              <>
++                <Typography variant="body2" sx={{ mr: 'auto' }}>
++                  {t('proxies.page.nodeDeletion.selected', {
++                    count: selectedNames.length,
++                  })}
++                  {groupName && ` · ${groupName}`}
++                </Typography>
++                <Button
++                  size="small"
++                  disabled={busy || candidates.length === 0}
++                  onClick={() => setSelected(new Set(candidates))}
++                >
++                  {t('proxies.page.nodeDeletion.selectAll')}
++                </Button>
++                <Button
++                  size="small"
++                  disabled={busy || selectedNames.length === 0}
++                  onClick={() => setSelected(new Set())}
++                >
++                  {t('proxies.page.nodeDeletion.clear')}
++                </Button>
++                <Button
++                  size="small"
++                  variant="contained"
++                  color="error"
++                  startIcon={<DeleteOutlineRounded />}
++                  disabled={busy || selectedNames.length === 0}
++                  loading={busy}
++                  onClick={() => void apply(selectedNames)}
++                >
++                  {t('proxies.page.nodeDeletion.deleteSelected')}
++                </Button>
++                <Button
++                  size="small"
++                  color="error"
++                  disabled={busy || candidates.length === 0}
++                  onClick={() => setConfirmAll(candidates)}
++                >
++                  {t(
++                    groupName
++                      ? 'proxies.page.nodeDeletion.deleteGroup'
++                      : 'proxies.page.nodeDeletion.deleteAll',
++                  )}
++                </Button>
++                <Button size="small" disabled={busy} onClick={stop}>
++                  {t('proxies.page.nodeDeletion.done')}
++                </Button>
++              </>
++            ) : (
++              <Button
++                size="small"
++                variant="outlined"
++                startIcon={<DeleteOutlineRounded />}
++                disabled={!profiles?.current || candidates.length === 0}
++                onClick={() => start()}
++              >
++                {t('proxies.page.nodeDeletion.start')}
++              </Button>
++            )}
++            {deletedNames.length > 0 && (
++              <Button
++                size="small"
++                disabled={busy}
++                onClick={() => void apply(deletedNames, true)}
++              >
++                {t('proxies.page.nodeDeletion.restore', {
++                  count: deletedNames.length,
++                })}
++              </Button>
++            )}
++          </Box>
++        )}
++        {active && (
++          <Typography
++            variant="caption"
++            color="text.secondary"
++            sx={{ px: 1.5, pb: 1 }}
++          >
++            {t('proxies.page.nodeDeletion.hint')}
++          </Typography>
++        )}
++        {error && (
++          <Alert severity="error" onClose={() => setError(undefined)}>
++            {error}
++          </Alert>
++        )}
++        <Box sx={{ flex: 1, minHeight: 0 }}>{children}</Box>
++      </Box>
++      <BaseDialog
++        open={confirmAll !== null}
++        title={t('proxies.page.nodeDeletion.deleteAll')}
++        okBtn={t('proxies.page.nodeDeletion.deleteSelected')}
++        cancelBtn={t('shared.actions.cancel')}
++        loading={busy}
++        disableCancel={busy}
++        onOk={() => void apply(confirmAll ?? [])}
++        onCancel={() => setConfirmAll(null)}
++        onClose={() => {
++          if (!busyRef.current) setConfirmAll(null)
++        }}
++      >
++        {t('proxies.page.nodeDeletion.confirmAll', {
++          count: confirmAll?.length ?? 0,
++        })}
++      </BaseDialog>
++    </NodeDeletionContext>
++  )
++}
+diff --git a/src/components/proxy/node-selection-model.test.ts b/src/components/proxy/node-selection-model.test.ts
+new file mode 100644
+index 0000000..26009a6
+--- /dev/null
++++ b/src/components/proxy/node-selection-model.test.ts
+@@ -0,0 +1,39 @@
++import { expect, test } from 'vitest'
++
++import { isDeletableNode, selectNodeNames } from './node-selection-model'
++
++test('Explorer selection replaces, toggles, and spans the displayed sorted order', () => {
++  const order = ['C', 'A', 'B', 'D']
++  const single = selectNodeNames(
++    new Set(['D']),
++    'C',
++    order,
++    undefined,
++    false,
++    false,
++  )
++  expect([...single]).toEqual(['C'])
++  const multiple = selectNodeNames(single, 'D', order, 'C', true, false)
++  expect([...multiple]).toEqual(['C', 'D'])
++  expect([...selectNodeNames(multiple, 'C', order, 'D', true, false)]).toEqual([
++    'D',
++  ])
++  expect([...selectNodeNames(multiple, 'B', order, 'C', false, true)]).toEqual([
++    'C',
++    'A',
++    'B',
++  ])
++  expect([
++    ...selectNodeNames(new Set(['D']), 'B', order, 'C', true, true),
++  ]).toEqual(['D', 'C', 'A', 'B'])
++  expect([...multiple]).toEqual(['C', 'D'])
++})
++
++test('a stale range anchor becomes a single selection and built-in policies cannot be deleted', () => {
++  expect([
++    ...selectNodeNames(new Set(['D']), 'B', ['A', 'B'], 'C', false, true),
++  ]).toEqual(['B'])
++  expect(isDeletableNode({ name: 'DIRECT', type: 'Direct' })).toBe(false)
++  expect(isDeletableNode({ name: 'reject policy', type: 'Reject' })).toBe(false)
++  expect(isDeletableNode({ name: 'Tokyo [1]', type: 'Vless' })).toBe(true)
++})
+diff --git a/src/components/proxy/node-selection-model.ts b/src/components/proxy/node-selection-model.ts
+new file mode 100644
+index 0000000..13edc27
+--- /dev/null
++++ b/src/components/proxy/node-selection-model.ts
+@@ -0,0 +1,45 @@
++import type { ProxyNodeView } from '@/types/proxy-view'
++
++const builtinNames = new Set([
++  'DIRECT',
++  'REJECT',
++  'REJECT-DROP',
++  'PASS',
++  'PASS-RULE',
++  'COMPATIBLE',
++])
++const builtinTypes = new Set([
++  'Direct',
++  'Reject',
++  'RejectDrop',
++  'Compatible',
++  'Pass',
++  'PassRule',
++  'Dns',
++])
++
++export const isDeletableNode = (node: Pick<ProxyNodeView, 'name' | 'type'>) =>
++  !builtinNames.has(node.name) && !builtinTypes.has(node.type)
++
++export function selectNodeNames(
++  selected: ReadonlySet<string>,
++  name: string,
++  order: readonly string[],
++  anchor: string | undefined,
++  toggle: boolean,
++  range: boolean,
++): Set<string> {
++  const start = anchor === undefined ? -1 : order.indexOf(anchor)
++  const end = order.indexOf(name)
++  if (range && start >= 0 && end >= 0) {
++    return new Set([
++      ...(toggle ? selected : []),
++      ...order.slice(Math.min(start, end), Math.max(start, end) + 1),
++    ])
++  }
++  if (!toggle) return new Set([name])
++  const next = new Set(selected)
++  if (next.has(name)) next.delete(name)
++  else next.add(name)
++  return next
++}
+diff --git a/src/components/proxy/proxy-group-tools.tsx b/src/components/proxy/proxy-group-tools.tsx
+index 44cc8a3..47f685a 100644
+--- a/src/components/proxy/proxy-group-tools.tsx
++++ b/src/components/proxy/proxy-group-tools.tsx
+@@ -1,4 +1,5 @@
+ import AccessTimeRounded from '@mui/icons-material/AccessTimeRounded'
++import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
+ import MyLocationRounded from '@mui/icons-material/MyLocationRounded'
+ import NetworkCheckRounded from '@mui/icons-material/NetworkCheckRounded'
+ import SearchOffRounded from '@mui/icons-material/SearchOffRounded'
+@@ -24,6 +25,7 @@ import { BaseSearchBox, type SearchState } from '../base'
+ 
+ import type { ProxySortType } from './use-filter-sort'
+ import type { HeadState } from './use-head-state'
++import { useNodeDeletion } from './use-node-deletion'
+ 
+ interface Props {
+   sx?: SxProps
+@@ -60,6 +62,7 @@ export const ProxyGroupTools = memo(function ProxyGroupTools(props: Props) {
+   } = headState
+ 
+   const { t } = useTranslation()
++  const deletion = useNodeDeletion()
+ 
+   const { verge } = useVerge()
+   const defaultLatencyUrl =
+@@ -276,6 +279,22 @@ export const ProxyGroupTools = memo(function ProxyGroupTools(props: Props) {
+           <SearchRounded fontSize="inherit" />
+         )}
+       </IconButton>
++      {deletion && (
++        <IconButton
++          size="small"
++          color="inherit"
++          title={t('proxies.page.nodeDeletion.start')}
++          disabled={deletion.busy}
++          onClick={(event) => {
++            event.preventDefault()
++            event.stopPropagation()
++            onHeadState({ open: true })
++            deletion.start(groupName)
++          }}
++        >
++          <DeleteOutlineRounded fontSize="inherit" />
++        </IconButton>
++      )}
+       {side === 'left' && textInput}
+     </Box>
+   )
+diff --git a/src/components/proxy/proxy-groups.tsx b/src/components/proxy/proxy-groups.tsx
+index 2489b2a..1221012 100644
+--- a/src/components/proxy/proxy-groups.tsx
++++ b/src/components/proxy/proxy-groups.tsx
+@@ -32,6 +32,8 @@ import {
+ } from '@/types/proxy-view'
+ import { debugLog } from '@/utils/debug'
+ 
++import { NodeDeletionProvider } from './node-deletion-context'
++import { isDeletableNode } from './node-selection-model'
+ import { ProxyEmptyState } from './proxy-empty-state'
+ import {
+   resolveEmptyListReason,
+@@ -42,6 +44,7 @@ import {
+   ProxyGroupNavigator,
+ } from './proxy-group-navigator'
+ import { ProxyRender } from './proxy-render'
++import { useNodeDeletion } from './use-node-deletion'
+ import {
+   PROXY_GROUP_HEADER_SENSORS,
+   useProxyGroupHeaderLayout,
+@@ -93,6 +96,26 @@ function useProxyRenderState(
+     isChainMode,
+     activeSelectedGroup,
+   )
++  const deletion = useNodeDeletion()
++  const registerOrder = deletion?.registerOrder
++  useEffect(() => {
++    const orders = new Map<string, string[]>()
++    for (const item of renderList) {
++      const members =
++        item.type === 2 && item.member
++          ? [item.member.member]
++          : item.type === 4
++            ? (item.memberCol ?? []).map(({ member }) => member)
++            : []
++      for (const member of members) {
++        if (member.kind !== 'node' || !isDeletableNode(member.node)) continue
++        const names = orders.get(item.group.name) ?? []
++        names.push(member.ref.name)
++        orders.set(item.group.name, names)
++      }
++    }
++    registerOrder?.(orders)
++  }, [renderList, registerOrder])
+   const scrollPositionKey = useMemo(
+     () =>
+       isChainMode
+@@ -608,7 +631,7 @@ function NormalProxyGroups(props: { mode: string }) {
+   )
+ }
+ 
+-export const ProxyGroups = (props: Props) => {
++const ProxyGroupsContent = (props: Props) => {
+   const { mode, isChainMode = false, chainConfigData } = props
+   const { profiles, isLoading: isProfilesLoading } = useProfiles()
+   const { isProxyViewPending } = useProxiesData()
+@@ -637,3 +660,16 @@ export const ProxyGroups = (props: Props) => {
+       )
+   }
+ }
++
++export const ProxyGroups = (props: Props) => {
++  const { profiles } = useProfiles()
++  const { mode, isChainMode } = props
++  return (
++    <NodeDeletionProvider
++      key={`${profiles?.current ?? ''}:${mode}:${isChainMode ?? false}`}
++      enabled={mode !== 'direct' && !isChainMode}
++    >
++      <ProxyGroupsContent {...props} />
++    </NodeDeletionProvider>
++  )
++}
+diff --git a/src/components/proxy/proxy-item-mini.tsx b/src/components/proxy/proxy-item-mini.tsx
+index 5bc9026..e62d0e6 100644
+--- a/src/components/proxy/proxy-item-mini.tsx
++++ b/src/components/proxy/proxy-item-mini.tsx
+@@ -11,6 +11,8 @@ import {
+   type ResolvedProxyMember,
+ } from '@/types/proxy-view'
+ 
++import { useNodeCardSelection } from './use-node-deletion'
++
+ interface Props {
+   group: ProxyGroupView
+   member: ResolvedProxyMember
+@@ -27,6 +29,7 @@ export const ProxyItemMini = (props: Props) => {
+   const name = member.ref.name
+   const type = unresolved ? member.ref.reason : (details?.type ?? '')
+   const now = member.kind === 'group' ? member.group.now : undefined
++  const deletion = useNodeCardSelection(member, group.name)
+ 
+   const { t } = useTranslation()
+ 
+@@ -39,9 +42,16 @@ export const ProxyItemMini = (props: Props) => {
+   return (
+     <ListItemButton
+       dense
+-      disabled={unresolved}
+-      selected={!unresolved && selected}
+-      onClick={unresolved ? undefined : () => onClick?.(member)}
++      disabled={unresolved || deletion.disabled}
++      selected={
++        !unresolved && (deletion.selecting ? deletion.checked : selected)
++      }
++      onClick={
++        unresolved
++          ? undefined
++          : (event) =>
++              deletion.selecting ? deletion.onSelect(event) : onClick?.(member)
++      }
+       sx={[
+         {
+           height: 56,
+@@ -81,7 +91,8 @@ export const ProxyItemMini = (props: Props) => {
+         },
+       ]}
+     >
+-      <Box title={`${name}\n${now ?? ''}`} sx={{ overflow: 'hidden' }}>
++      {deletion.checkbox}
++      <Box title={`${name}\n${now ?? ''}`} sx={{ overflow: 'hidden', flex: 1 }}>
+         <Typography
+           variant="body2"
+           component="div"
+diff --git a/src/components/proxy/proxy-item.tsx b/src/components/proxy/proxy-item.tsx
+index 7b279c3..3b53234 100644
+--- a/src/components/proxy/proxy-item.tsx
++++ b/src/components/proxy/proxy-item.tsx
+@@ -21,6 +21,8 @@ import {
+   type ResolvedProxyMember,
+ } from '@/types/proxy-view'
+ 
++import { useNodeCardSelection } from './use-node-deletion'
++
+ interface Props {
+   group: ProxyGroupView
+   member: ResolvedProxyMember
+@@ -56,6 +58,7 @@ export const ProxyItem = (props: Props) => {
+   const name = member.ref.name
+   const type = unresolved ? member.ref.reason : (details?.type ?? '')
+   const now = member.kind === 'group' ? member.group.now : undefined
++  const deletion = useNodeCardSelection(member, group.name)
+ 
+   // -1/<=0 为不显示，-2 为 loading
+   const { delayValue, isPreset, timeout, onDelay } = useProxyDelayState(
+@@ -67,9 +70,18 @@ export const ProxyItem = (props: Props) => {
+     <ListItem sx={sx}>
+       <ListItemButton
+         dense
+-        disabled={unresolved}
+-        selected={!unresolved && selected}
+-        onClick={unresolved ? undefined : () => onClick?.(member)}
++        disabled={unresolved || deletion.disabled}
++        selected={
++          !unresolved && (deletion.selecting ? deletion.checked : selected)
++        }
++        onClick={
++          unresolved
++            ? undefined
++            : (event) =>
++                deletion.selecting
++                  ? deletion.onSelect(event)
++                  : onClick?.(member)
++        }
+         sx={[
+           { borderRadius: 1 },
+           ({ palette: { mode, primary } }) => {
+@@ -97,6 +109,7 @@ export const ProxyItem = (props: Props) => {
+           },
+         ]}
+       >
++        {deletion.checkbox}
+         <ListItemText
+           title={name}
+           secondary={
+diff --git a/src/components/proxy/use-node-deletion.tsx b/src/components/proxy/use-node-deletion.tsx
+new file mode 100644
+index 0000000..7180744
+--- /dev/null
++++ b/src/components/proxy/use-node-deletion.tsx
+@@ -0,0 +1,60 @@
++import { Checkbox } from '@mui/material'
++import { createContext, use, type MouseEvent } from 'react'
++
++import type { ResolvedProxyMember } from '@/types/proxy-view'
++
++import { isDeletableNode } from './node-selection-model'
++
++export interface NodeDeletionState {
++  active: boolean
++  busy: boolean
++  groupName?: string
++  selected: ReadonlySet<string>
++  start: (groupName?: string) => void
++  registerOrder: (orders: Map<string, string[]>) => void
++  select: (
++    name: string,
++    group: string,
++    event: MouseEvent,
++    checkbox?: boolean,
++  ) => void
++}
++
++export const NodeDeletionContext = createContext<NodeDeletionState | null>(null)
++export const useNodeDeletion = () => use(NodeDeletionContext)
++
++export function useNodeCardSelection(
++  member: ResolvedProxyMember,
++  group: string,
++) {
++  const deletion = useNodeDeletion()
++  const selecting = deletion?.active ?? false
++  const eligible =
++    member.kind === 'node' &&
++    isDeletableNode(member.node) &&
++    (!deletion?.groupName || deletion.groupName === group)
++  const checked = deletion?.selected.has(member.ref.name) ?? false
++  const checkbox =
++    selecting && eligible ? (
++      <Checkbox
++        checked={checked}
++        disabled={deletion?.busy}
++        size="small"
++        slotProps={{ input: { 'aria-label': member.ref.name } }}
++        onClick={(event) => {
++          event.stopPropagation()
++          deletion?.select(member.ref.name, group, event, true)
++        }}
++        sx={{ mr: 0.5, p: 0.5 }}
++      />
++    ) : null
++  return {
++    selecting,
++    checked,
++    disabled: selecting && (!eligible || deletion?.busy),
++    checkbox,
++    onSelect: (event: MouseEvent) => {
++      if (eligible) deletion?.select(member.ref.name, group, event)
++    },
++  }
++}
+diff --git a/src/locales/en/proxies.json b/src/locales/en/proxies.json
+index ead3f0c..25e2036 100644
+--- a/src/locales/en/proxies.json
++++ b/src/locales/en/proxies.json
+@@ -1,5 +1,21 @@
+ {
+   "page": {
++    "nodeDeletion": {
++      "start": "Select nodes",
++      "selected": "{{count}} selected",
++      "selectAll": "Select all",
++      "clear": "Clear selection",
++      "deleteSelected": "Delete selected",
++      "deleteGroup": "Delete all in group",
++      "deleteAll": "Delete all nodes",
++      "done": "Done",
++      "restore": "Restore deleted ({{count}})",
++      "hint": "Click to select · Ctrl+click for multiple · Shift+click for range · Delete to remove · Ctrl+A to select all · Esc to exit. Deletion applies to matching names across this profile and persists after updates. Empty groups fall back to direct access.",
++      "confirmAll": "Delete all {{count}} nodes? Groups with no remaining nodes will use direct access. You can restore deleted nodes afterwards.",
++      "failed": "The configuration could not be applied. No deletion was saved. Retry after the core is ready.",
++      "deleted": "Deleted {{count}} nodes",
++      "restored": "Restored {{count}} nodes"
++    },
+     "modes": {
+       "rule": "Rule",
+       "global": "Global",
+diff --git a/src/locales/zh/proxies.json b/src/locales/zh/proxies.json
+index cc792f5..2aa3f36 100644
+--- a/src/locales/zh/proxies.json
++++ b/src/locales/zh/proxies.json
+@@ -1,5 +1,21 @@
+ {
+   "page": {
++    "nodeDeletion": {
++      "start": "选择节点",
++      "selected": "已选 {{count}} 个节点",
++      "selectAll": "全选",
++      "clear": "取消选择",
++      "deleteSelected": "删除所选",
++      "deleteGroup": "删除本组全部",
++      "deleteAll": "删除全部节点",
++      "done": "完成",
++      "restore": "恢复已删除节点（{{count}}）",
++      "hint": "单击选择 · Ctrl＋单击多选 · Shift＋单击连续选择 · Delete 删除 · Ctrl＋A 全选 · Esc 退出。删除作用于本订阅各组中的同名节点，更新后仍生效；空组回退到直连。",
++      "confirmAll": "确定删除这 {{count}} 个节点？没有剩余节点的代理组将使用直连。删除后可以恢复。",
++      "failed": "配置未能成功应用，未保存删除操作。请在内核就绪后重试。",
++      "deleted": "已删除 {{count}} 个节点",
++      "restored": "已恢复 {{count}} 个节点"
++    },
+     "modes": {
+       "rule": "规则",
+       "global": "全局",
+diff --git a/src/locales/zhtw/proxies.json b/src/locales/zhtw/proxies.json
+index 48150df..cab09f5 100644
+--- a/src/locales/zhtw/proxies.json
++++ b/src/locales/zhtw/proxies.json
+@@ -1,5 +1,21 @@
+ {
+   "page": {
++    "nodeDeletion": {
++      "start": "選擇節點",
++      "selected": "已選 {{count}} 個節點",
++      "selectAll": "全選",
++      "clear": "取消選擇",
++      "deleteSelected": "刪除所選",
++      "deleteGroup": "刪除本組全部",
++      "deleteAll": "刪除全部節點",
++      "done": "完成",
++      "restore": "還原已刪除節點（{{count}}）",
++      "hint": "按一下選擇 · Ctrl＋點選多選 · Shift＋點選連續選擇 · Delete 刪除 · Ctrl＋A 全選 · Esc 結束。刪除套用於本訂閱各組中的同名節點，更新後仍有效；空組回退至直連。",
++      "confirmAll": "確定刪除這 {{count}} 個節點？沒有剩餘節點的代理組將使用直連。刪除後可以還原。",
++      "failed": "設定未能成功套用，未儲存刪除操作。請在核心就緒後重試。",
++      "deleted": "已刪除 {{count}} 個節點",
++      "restored": "已還原 {{count}} 個節點"
++    },
+     "modes": {
+       "rule": "規則",
+       "global": "全局",
+diff --git a/src/services/cmds.ts b/src/services/cmds.ts
+index c2df176..b05e027 100644
+--- a/src/services/cmds.ts
++++ b/src/services/cmds.ts
+@@ -79,6 +79,18 @@ export async function patchProfile(
+   return invoke<void>('patch_profile', { index, profile })
+ }
+ 
++export async function changeDeletedNodes(
++  index: string,
++  names: string[],
++  restore = false,
++) {
++  return invoke<ValidationOutcome>('change_deleted_nodes', {
++    index,
++    names,
++    restore,
++  })
++}
++
+ export async function getClashInfo() {
+   return invoke<IClashInfo | null>('get_clash_info')
+ }
+diff --git a/src/types/generated/i18n-keys.ts b/src/types/generated/i18n-keys.ts
+index ee97efb..f5dd073 100644
+--- a/src/types/generated/i18n-keys.ts
++++ b/src/types/generated/i18n-keys.ts
+@@ -280,6 +280,20 @@ export const translationKeys = [
+   'profiles.modals.confirmDelete.message',
+   'profiles.modals.logViewer.title',
+   'profiles.modals.qrViewer.title',
++  'proxies.page.nodeDeletion.start',
++  'proxies.page.nodeDeletion.selected',
++  'proxies.page.nodeDeletion.selectAll',
++  'proxies.page.nodeDeletion.clear',
++  'proxies.page.nodeDeletion.deleteSelected',
++  'proxies.page.nodeDeletion.deleteGroup',
++  'proxies.page.nodeDeletion.deleteAll',
++  'proxies.page.nodeDeletion.done',
++  'proxies.page.nodeDeletion.restore',
++  'proxies.page.nodeDeletion.hint',
++  'proxies.page.nodeDeletion.confirmAll',
++  'proxies.page.nodeDeletion.failed',
++  'proxies.page.nodeDeletion.deleted',
++  'proxies.page.nodeDeletion.restored',
+   'proxies.page.modes.rule',
+   'proxies.page.modes.global',
+   'proxies.page.modes.direct',
+diff --git a/src/types/generated/i18n-resources.ts b/src/types/generated/i18n-resources.ts
+index 5d71ad7..1bcf8a7 100644
+--- a/src/types/generated/i18n-resources.ts
++++ b/src/types/generated/i18n-resources.ts
+@@ -574,6 +574,22 @@ export interface TranslationResources {
+           global: string
+           rule: string
+         }
++        nodeDeletion: {
++          clear: string
++          confirmAll: string
++          deleteAll: string
++          deleted: string
++          deleteGroup: string
++          deleteSelected: string
++          done: string
++          failed: string
++          hint: string
++          restore: string
++          restored: string
++          selectAll: string
++          selected: string
++          start: string
++        }
+         placeholders: {
+           delayCheckUrl: string
+         }
+diff --git a/src/types/global.d.ts b/src/types/global.d.ts
+index 13da214..a7482a3 100644
+--- a/src/types/global.d.ts
++++ b/src/types/global.d.ts
+@@ -240,6 +240,8 @@ interface IProfileItem {
+ }
+ 
+ interface IProfileOption {
++  deleted_nodes?: string[]
++  deleted_providers?: string[]
+   user_agent?: string
+   with_proxy?: boolean
+   self_proxy?: boolean

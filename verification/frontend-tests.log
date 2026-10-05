@@ -1,0 +1,10 @@
+$ vitest run
+
+ RUN  v5.0.1 /workspace/scratch/8418877bd126/clash-verge-rev
+
+
+ Test Files  7 passed (7)
+      Tests  29 passed (29)
+   Start at  05:11:10
+   Duration  2.61s (tests 72%, transform 20%, import 7%, worker 1%)
+

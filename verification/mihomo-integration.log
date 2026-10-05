@@ -1,0 +1,7 @@
+single-active: PASS
+all-core: PASS
+provider-prefix-exact: PASS
+provider-update: PASS
+all-provider: PASS
+all-include-groups: PASS
+provider-prefix-collision: PASS
