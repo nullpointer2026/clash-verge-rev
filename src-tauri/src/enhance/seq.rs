@@ -74,6 +74,32 @@ pub fn use_seq(seq: SeqMap, mut config: Mapping, field: &str) -> Mapping {
     }
 
     updated_items.extend(append);
+
+    if field == "proxies" {
+        let mut seen_names = HashSet::new();
+        let mut deduplicated_items = Sequence::new();
+        for item in updated_items {
+            if let Value::Mapping(mut map) = item {
+                if let Some(Value::String(name)) = map.get("name").cloned() {
+                    if !seen_names.insert(name.clone()) {
+                        let mut index = 1;
+                        let mut candidate = format!("{name} ({index})");
+                        while seen_names.contains(&candidate) {
+                            index += 1;
+                            candidate = format!("{name} ({index})");
+                        }
+                        seen_names.insert(candidate.clone());
+                        map.insert(Value::String("name".into()), Value::String(candidate));
+                    }
+                }
+                deduplicated_items.push(Value::Mapping(map));
+            } else {
+                deduplicated_items.push(item);
+            }
+        }
+        updated_items = deduplicated_items;
+    }
+
     config.insert(Value::String(field.into()), Value::Sequence(updated_items));
 
     if field != "proxies" {

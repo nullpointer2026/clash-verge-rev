@@ -34,6 +34,10 @@ import { showNotice } from '@/services/notice-service'
 import { useThemeMode } from '@/services/states'
 import type { MonacoEditorInstance } from '@/types/monaco'
 import { MONACO_FONT_FAMILY } from '@/utils/font-family'
+import {
+  deduplicateAndMergeProxies,
+  type DeduplicateResult,
+} from '@/utils/proxy-deduplicate'
 import parseUri from '@/utils/uri-parser'
 import { parseYamlSafe } from '@/utils/yaml'
 
@@ -179,7 +183,6 @@ export const ProxiesEditorViewer = (props: Props) => {
   // 优化：异步分片解析，避免主线程阻塞，解析完成后批量setState
   const handleParseAsync = (cb: (proxies: IProxyConfig[]) => void) => {
     const proxies: IProxyConfig[] = []
-    const names: string[] = []
     let uris: string
     try {
       uris = atob(proxyUri)
@@ -195,11 +198,11 @@ export const ProxiesEditorViewer = (props: Props) => {
       const end = Math.min(idx + batchSize, lines.length)
       for (; idx < end; idx++) {
         const uri = lines[idx]
+        if (!uri || !uri.trim()) continue
         try {
           const proxy = parseUri(uri.trim())
-          if (!names.includes(proxy.name)) {
+          if (proxy && proxy.name) {
             proxies.push(proxy)
-            names.push(proxy.name)
           }
         } catch (err) {
           console.warn(
@@ -221,6 +224,27 @@ export const ProxiesEditorViewer = (props: Props) => {
       }
     }
     parseBatch()
+  }
+
+  const showBatchNotice = (result: DeduplicateResult) => {
+    const { addedProxies, skippedCount, renamedCount, totalParsed } = result
+    if (totalParsed === 0) {
+      showNotice.warning('未解析到有效节点，请检查输入的 URI 或 Base64 格式')
+      return
+    }
+    if (addedProxies.length === 0) {
+      showNotice.info(`未添加新节点：检测到的 ${skippedCount} 个节点在本地均已存在`)
+      return
+    }
+    const details: string[] = []
+    if (skippedCount > 0) {
+      details.push(`跳过 ${skippedCount} 个重复节点`)
+    }
+    if (renamedCount > 0) {
+      details.push(`自动重命名 ${renamedCount} 个同名节点`)
+    }
+    const detailStr = details.length > 0 ? `（已${details.join('，')}）` : ''
+    showNotice.success(`成功添加 ${addedProxies.length} 个节点${detailStr}`)
   }
   const fetchProfile = useCallback(async () => {
     const data = await readProfileFile(profileUid)
@@ -392,6 +416,7 @@ export const ProxiesEditorViewer = (props: Props) => {
                     placeholder={t(
                       'profiles.modals.proxiesEditor.placeholders.multiUri',
                     )}
+                    value={proxyUri}
                     fullWidth
                     rows={9}
                     multiline
@@ -406,8 +431,24 @@ export const ProxiesEditorViewer = (props: Props) => {
                   variant="contained"
                   startIcon={<VerticalAlignTopRounded />}
                   onClick={() => {
-                    handleParseAsync((proxies) => {
-                      setPrependSeq((prev) => [...proxies, ...prev])
+                    handleParseAsync((parsedProxies) => {
+                      const existing = [
+                        ...prependSeq,
+                        ...proxyList,
+                        ...appendSeq,
+                      ]
+                      const result = deduplicateAndMergeProxies(
+                        parsedProxies,
+                        existing,
+                      )
+                      if (result.addedProxies.length > 0) {
+                        setPrependSeq((prev) => [
+                          ...result.addedProxies,
+                          ...prev,
+                        ])
+                      }
+                      showBatchNotice(result)
+                      setProxyUri('')
                     })
                   }}
                 >
@@ -420,8 +461,24 @@ export const ProxiesEditorViewer = (props: Props) => {
                   variant="contained"
                   startIcon={<VerticalAlignBottomRounded />}
                   onClick={() => {
-                    handleParseAsync((proxies) => {
-                      setAppendSeq((prev) => [...prev, ...proxies])
+                    handleParseAsync((parsedProxies) => {
+                      const existing = [
+                        ...prependSeq,
+                        ...proxyList,
+                        ...appendSeq,
+                      ]
+                      const result = deduplicateAndMergeProxies(
+                        parsedProxies,
+                        existing,
+                      )
+                      if (result.addedProxies.length > 0) {
+                        setAppendSeq((prev) => [
+                          ...prev,
+                          ...result.addedProxies,
+                        ])
+                      }
+                      showBatchNotice(result)
+                      setProxyUri('')
                     })
                   }}
                 >
